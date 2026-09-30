@@ -14,7 +14,7 @@ def run_process(func, args):
     You can use mp.spawn function as a reference.
     '''
     nprocs = args.num_gpu
-    raise NotImplementedError()
+    mp.spawn(func, args=(args,), nprocs=nprocs)
 
 def initialize_group(proc_id, host, port, num_gpu):
     ''' Problem 2: Setup GPU group
@@ -28,7 +28,14 @@ def initialize_group(proc_id, host, port, num_gpu):
     2. torch.cuda.set_device() for setting device
     '''
     dist_url = f"tcp://{host}:{port}"
-    raise NotImplementedError()
+    dist.init_process_group(
+        backend="nccl",
+        init_method=dist_url,
+        rank=proc_id,
+        world_size=num_gpu
+    )
+
+    torch.cuda.set_device(proc_id)
 
 def destroy_process():
     ''' Problem 3: Destroy GPU group
@@ -36,4 +43,4 @@ def destroy_process():
     Implement destroy_process function.
     Just call the torch.distributed's destroy function.
     '''
-    raise NotImplementedError()
+    dist.destroy_process_group()
