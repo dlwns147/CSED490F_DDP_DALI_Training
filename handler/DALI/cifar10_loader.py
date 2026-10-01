@@ -90,44 +90,68 @@ class CifarPipeline(Pipeline):
             ])
     '''
 
-    def __init__(self):
-        pass
+    def __init__(self, data_dir, batch_size, is_train, cutout_length,
+                 device_id, shard_id, num_shards, num_workers, seed=12345):
+        # Offset the seed by shard_id so each GPU draws its own crop / flip / cutout
+        # (the file-list shuffle uses DALI's fixed internal seed, so shards stay disjoint).
+        super(CifarPipeline, self).__init__(batch_size, num_workers, device_id, seed=seed + shard_id)
+        self.data_dir = data_dir
+        self.is_train = is_train
+        self.cutout_length = cutout_length
+        self.shard_id = shard_id
+        self.num_shards = num_shards
 
-    """SCAFFOLD"""
-    
-    # def __init__(self, data_dir, batch_size, is_train, cutout_length,
-    #              device_id, shard_id, num_shards, num_workers):
-    #     super(CifarPipeline, self).__init__(batch_size, num_workers, device_id, seed=12345)
-    #     self.data_dir = data_dir
-    #     self.is_train = is_train
-    #     self.cutout_length = cutout_length
-    #     self.shard_id = shard_id
-    #     self.num_shards = num_shards
+    def define_graph(self):
+        # Each process reads only its own 1/num_shards of the files (== DistributedSampler).
+        # pad_last_batch repeats the last sample so every shard has the same length,
+        # so all ranks run the same number of iterations and DDP all-reduce never hangs.
+        images, labels = fn.readers.file(
+            name="Reader",
+            file_root=self.data_dir,
+            shard_id=self.shard_id,
+            num_shards=self.num_shards,
+            random_shuffle=self.is_train,
+            pad_last_batch=True,
+        )
+        # JPEG/PNG decode on the GPU (HWC, uint8)
+        images = fn.decoders.image(
+            images, device="mixed", output_type=types.RGB
+        )
 
-    # def define_graph(self):
-    #     images, labels = fn.readers.file(
-    #         name="Reader",
-    #         "fill it"
-    #     )
-    #     images = fn.decoders.image(
-    #         images, device="mixed", output_type=types.RGB
-    #     )
+        if self.is_train:
+            # 1. Padding: 32x32 -> 40x40 with 4 zero pixels on every side (RandomCrop(32, padding=4))
+            images = fn.paste(images, ratio=40.0 / 32.0, paste_x=0.5, paste_y=0.5, fill_value=0)
+            # 2. Horizontal Flip: p = 0.5 (RandomHorizontalFlip)
+            mirror = fn.random.coin_flip(probability=0.5)
+            # 3. Crop, Mirror, Normalize: integer offset in {0..8} on each axis, like RandomCrop,
+            #    then HWC uint8 -> CHW float, (x - mean) / std (ToTensor + Normalize)
+            crop_pos = [i / 8.0 for i in range(9)]
+            images = fn.crop_mirror_normalize(
+                images,
+                crop=(32, 32),
+                crop_pos_x=fn.random.uniform(values=crop_pos),
+                crop_pos_y=fn.random.uniform(values=crop_pos),
+                mirror=mirror,
+                mean=CIFAR_MEAN,
+                std=CIFAR_STD,
+                dtype=types.FLOAT,
+                output_layout="CHW",
+            )
+            # 4. Cutout: after Normalize, same order as the DP/DDP transform
+            if self.cutout_length > 0:
+                images = fn_dali_cutout(images, self.cutout_length)
+        else:
+            # 1. Crop, Normalize (crop is a no-op on 32x32; ToTensor + Normalize)
+            images = fn.crop_mirror_normalize(
+                images,
+                crop=(32, 32),
+                mean=CIFAR_MEAN,
+                std=CIFAR_STD,
+                dtype=types.FLOAT,
+                output_layout="CHW",
+            )
 
-    #     if self.is_train:
-    #         # 1. Padding
-    #         "fill it"
-    #         # 2. Horizontal Flip
-    #         "fill it"
-    #         # 3. Crop, Mirror, Normalize
-    #         "fill it"
-    #         # 4. Cutout
-    #         if self.cutout_length > 0:
-    #             "fill it"
-    #     else:
-    #         # 1. Crop, Normalize
-    #         "fill it"
-
-    #     return images, labels
+        return images, labels.gpu()
 
 def get_DALI_loader(test_batch, train_batch, root=base_dir, valid_size=0, valid_batch=0,
                cutout=16, num_workers=4, download=True, random_seed=12345, shuffle=True):
@@ -142,43 +166,44 @@ def get_DALI_loader(test_batch, train_batch, root=base_dir, valid_size=0, valid_
     We give you the DALIWrapper class, which is a wrapper of DALIGenericIterator, to maintain the same interface with the original loader.
     '''
 
-    raise NotImplementedError()
-    return None, None, None
-    
-    """SCAFFOLD"""
+    if dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:  # single process (e.g. a quick test without DDP)
+        world_size = 1
+        rank = 0
+    # initialize_group() already called torch.cuda.set_device(rank)
+    device_id = torch.cuda.current_device()
 
-    # world_size = "fill it"
-    # rank = "fill it"
-    
-    # train_dir = os.path.join(root, "train")
-    # valid_dir = os.path.join(root, "valid")
-    # test_dir = os.path.join(root, "test")
+    # train_batch / test_batch are PER-GPU batch sizes, same as get_DDP_loader
+    # (each of the world_size processes loads train_batch samples per iteration)
 
-    # train_loader, valid_loader, test_loader = None, None, None
+    train_dir = os.path.join(root, "train")
+    valid_dir = os.path.join(root, "valid")
+    test_dir = os.path.join(root, "test")
 
-    # if train_batch > 0:
-    #     pipe = CifarPipeline("fill it")
-    #     pipe.build()
-    #     dali_iter = DALIGenericIterator(pipe, reader_name="Reader",
-    #     # "fill it"
-    #     )
-    #     train_loader = DALIWrapper(dali_iter)
-        
-    # if valid_size > 0:
-    #     assert valid_batch > 0, "Validation batch size must be > 0"
-    #     pipe = CifarPipeline("fill it")
-    #     pipe.build()
-    #     dali_iter = DALIGenericIterator(pipe, reader_name="Reader",
-    #     # "fill it"
-    #     )
-    #     valid_loader = DALIWrapper(dali_iter)
-    
-    # if test_batch > 0:
-    #     pipe = CifarPipeline("fill it")
-    #     pipe.build()
-    #     dali_iter = DALIGenericIterator(pipe, reader_name="Reader",
-    #     # "fill it"
-    #     )
-    #     test_loader = DALIWrapper(dali_iter)
+    train_loader, valid_loader, test_loader = None, None, None
 
-    # return test_loader, train_loader, valid_loader
+    def build_loader(data_dir, batch, is_train, cutout_length):
+        pipe = CifarPipeline(data_dir, batch, is_train, cutout_length,
+                             device_id=device_id, shard_id=rank, num_shards=world_size,
+                             num_workers=num_workers, seed=random_seed)
+        pipe.build()
+        # PARTIAL: keep the last smaller batch (DataLoader drop_last=False), padded samples are trimmed.
+        # auto_reset: rewind at StopIteration so the loader can be iterated again next epoch.
+        dali_iter = DALIGenericIterator(pipe, ["data", "label"], reader_name="Reader",
+                                        last_batch_policy=LastBatchPolicy.PARTIAL,
+                                        auto_reset=True)
+        return DALIWrapper(dali_iter)
+
+    if train_batch > 0:
+        train_loader = build_loader(train_dir, train_batch, True, cutout)
+
+    if valid_size > 0:
+        assert valid_batch > 0, "Validation batch size must be > 0"
+        valid_loader = build_loader(valid_dir, valid_batch, False, 0)
+
+    if test_batch > 0:
+        test_loader = build_loader(test_dir, test_batch, False, 0)
+
+    return test_loader, train_loader, valid_loader
